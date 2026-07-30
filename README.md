@@ -11,6 +11,8 @@ as the foundation of a hidden-camera / covert-recording detector.
 Right now they ONLY detect and list devices. No classification, no upload detection yet.
 That comes in later steps once we confirm both boards see what's around you.
 
+In Arduino IDE: Tools → Partition Scheme → "Huge APP (3MB No OTA/1MB SPIFFS)"
+
 ## What each column means
 
 WiFi output:  MAC, RSSI (dBm), channel, packet count, seconds-since-seen
