@@ -34,9 +34,16 @@
                                  // brief blip = connected and reporting
 
 #define SCAN_SECONDS 5       // length of each scan pass
-// Keep this modest. BLE and WiFi both want RAM, and when the heap runs out the
-// Bluetooth stack calls abort() and the board reboot-loops. 120 was too many
-// once WiFi came up; each entry is ~72 bytes plus the library's own buffers.
+
+// How much of the time the BLE radio is actually listening, out of 100.
+// This is THE knob for detection quality:
+//   99 = listen almost continuously. Best detection. BLE and WiFi share one
+//        radio, so this leaves WiFi very little airtime.
+//   50 = half and half. Noticeably fewer devices, slower to spot them.
+// Start high; only lower it if the board starts rebooting with WiFi on.
+#define SCAN_WINDOW  90
+// Each entry is ~72 bytes of static RAM, which indirectly limits heap. 120 was
+// too many once WiFi came up alongside BLE; 48 is plenty for a room.
 #define MAX_DEVICES  48      // max devices remembered at once
 #define FORGET_AFTER 60000   // ms: drop a device if unseen this long
 #define MIN_FREE_HEAP 35000  // below this we skip reporting rather than crash
@@ -325,12 +332,10 @@ void setup() {
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new FoundCallback());
   scanner->setActiveScan(true);   // ask devices for names (uses a bit more power)
-  // BLE and WiFi share one radio. A 99/100 window means BLE is listening
-  // almost continuously, leaving WiFi almost no airtime -- which is a big
-  // part of why things fall over once both are running. 50/100 still catches
-  // devices readily (they advertise every 20-100ms) and lets WiFi breathe.
+
   scanner->setInterval(100);
-  scanner->setWindow(50);
+  scanner->setWindow(SCAN_WINDOW);
+  Serial.printf("Scan duty cycle: %d/100\n", SCAN_WINDOW);
 
   // Start WiFi only after BLE has taken the memory it needs.
   hotspotBegin();
