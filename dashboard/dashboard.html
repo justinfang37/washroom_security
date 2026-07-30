@@ -91,6 +91,13 @@
   .empty { padding:26px 14px; color:var(--dim); text-align:center; font-size:13px; }
   tbody.stale { opacity:.45; }
 
+  .more { border-top:1px solid var(--line); }
+  .more button {
+    width:100%; border:none; background:none; border-radius:0;
+    padding:11px; font-size:12.5px; color:var(--accent); font-weight:600;
+  }
+  .more button:hover { background:var(--detail); }
+
   /* ---- sweep ---- */
   #sweep { margin-bottom:18px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
@@ -142,6 +149,7 @@
       </table>
       <div class="empty" id="wifi-empty">waiting for data…</div>
     </div>
+    <div class="more" id="wifi-more" hidden></div>
   </div>
 
   <div class="panel">
@@ -154,6 +162,7 @@
       </table>
       <div class="empty" id="ble-empty">waiting for data…</div>
     </div>
+    <div class="more" id="ble-more" hidden></div>
   </div>
 </div>
 
@@ -164,6 +173,24 @@ let booted = false;
 let paused = false;
 
 const COLS = { wifi: 7, ble: 5 };   // column count, for the detail row's colspan
+
+// Long lists are unreadable, so show only the closest few until asked.
+const COLLAPSED_ROWS = 8;
+const showAll = { wifi: false, ble: false };
+
+function renderMore(which, total) {
+  const el = document.getElementById(which + '-more');
+  if (total <= COLLAPSED_ROWS) { el.hidden = true; return; }
+  el.hidden = false;
+  const open = showAll[which];
+  el.innerHTML = `<button>${open
+      ? `Show fewer (closest ${COLLAPSED_ROWS})`
+      : `Show all ${total} devices — ${total - COLLAPSED_ROWS} more`}</button>`;
+  el.querySelector('button').onclick = () => {
+    showAll[which] = !showAll[which];
+    tick();                      // redraw straight away
+  };
+}
 
 // Byte counts get large fast -- show them human-readably.
 function bytes(n) {
@@ -399,8 +426,15 @@ async function tick() {
     const wifi = devices.filter(d => d.source === 'wifi');
     const ble  = devices.filter(d => d.source === 'ble');
 
-    render(document.getElementById('wifi-table'), wifi);
-    render(document.getElementById('ble-table'), ble);
+    // Collapse to the closest few unless the user expanded the panel. Any row
+    // whose drawer is open stays visible so it can't vanish while being read.
+    const clip = (list, which) => showAll[which] ? list
+        : list.filter((d, i) => i < COLLAPSED_ROWS || expanded.has(d.key));
+
+    render(document.getElementById('wifi-table'), clip(wifi, 'wifi'));
+    render(document.getElementById('ble-table'),  clip(ble, 'ble'));
+    renderMore('wifi', wifi.length);
+    renderMore('ble', ble.length);
     document.getElementById('wifi-empty').style.display = wifi.length ? 'none' : '';
     document.getElementById('ble-empty').style.display  = ble.length  ? 'none' : '';
     document.getElementById('wifi-count').textContent =
