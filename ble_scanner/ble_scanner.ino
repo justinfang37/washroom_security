@@ -21,11 +21,11 @@
 #include <WiFiUdp.h>
 #include <stdarg.h>
 
-// ===== NETWORK: David's SoftAP (softap_demo.ino) =====
+// ===== NETWORK: the SoftAP created by softap_demo.ino =====
 // Set WIFI_SSID to "" to run USB/serial only, with no networking at all.
 // NOTE: Arduino IDE -> Tools -> Partition Scheme -> "Huge APP (3MB No OTA)"
 // BLE + WiFi together is a big build and won't fit the default partition.
-#define WIFI_SSID  "WashroomSweep-Test"   // David's SoftAP
+#define WIFI_SSID  "WashroomSweep-Test"   // the SoftAP board
 #define WIFI_PASS  "sweep12345"
 #define UNIT_ID    "ble-B"       // name this board (unique per board)
 #define UDP_PORT   4210          // must match monitor.py --udp-port
@@ -34,8 +34,12 @@
                                  // brief blip = connected and reporting
 
 #define SCAN_SECONDS 5       // length of each scan pass
-#define MAX_DEVICES  120     // max devices remembered at once
+// Keep this modest. BLE and WiFi both want RAM, and when the heap runs out the
+// Bluetooth stack calls abort() and the board reboot-loops. 120 was too many
+// once WiFi came up; each entry is ~72 bytes plus the library's own buffers.
+#define MAX_DEVICES  48      // max devices remembered at once
 #define FORGET_AFTER 60000   // ms: drop a device if unseen this long
+#define MIN_FREE_HEAP 35000  // below this we skip reporting rather than crash
 
 struct BleDev {
   char     addr[18];
@@ -214,8 +218,19 @@ void sendReport() {
   if (!reporting) return;
   if (WiFi.status() != WL_CONNECTED) return;  // hotspotPoll() handles reconnects
 
+  // Reporting is the FIRST thing to give up when memory gets tight. Crashing
+  // loses the whole device table; skipping one report loses nothing important.
+  if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
+    Serial.printf("!! heap low (%lu) -- skipping this report\n",
+                  (unsigned long)ESP.getFreeHeap());
+    return;
+  }
+
   uint32_t now = millis();
-  char buf[1200], nameEsc[48], makerEsc[32];
+  // static, not on the stack: 1.3 KB of locals in a task that also runs the
+  // WiFi/BLE callbacks is asking for trouble.
+  static char buf[1024];
+  static char nameEsc[48], makerEsc[32];
   int i = 0;
   while (i < MAX_DEVICES) {
     int len = 0;
@@ -224,7 +239,7 @@ void sendReport() {
             "{\"unit\":\"%s\",\"src\":\"ble\",\"devices\":[", UNIT_ID);
 
     int inChunk = 0;
-    while (i < MAX_DEVICES && inChunk < 8) {
+    while (i < MAX_DEVICES && inChunk < 6) {
       BleDev& d = devices[i];
       if (!d.used || now - d.lastSeen > FORGET_AFTER) { i++; continue; }
 
@@ -279,8 +294,12 @@ void hotspotPoll() {
   if (up && !reporting) {
     reporting = true;
     udp.begin(UDP_PORT);
-    Serial.printf("Hotspot connected. IP %s -- broadcasting to UDP port %d.\n",
-                  WiFi.localIP().toString().c_str(), UDP_PORT);
+    // Bringing up WiFi costs a big chunk of heap. Print it here: if this
+    // number is small, expect trouble, and lower MAX_DEVICES.
+    Serial.printf("Network connected. IP %s -- broadcasting to UDP port %d "
+                  "(free heap %lu)\n",
+                  WiFi.localIP().toString().c_str(), UDP_PORT,
+                  (unsigned long)ESP.getFreeHeap());
   } else if (!up && reporting) {
     reporting = false;
     Serial.println("Hotspot lost -- scanning continues, will retry.");
@@ -306,8 +325,12 @@ void setup() {
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new FoundCallback());
   scanner->setActiveScan(true);   // ask devices for names (uses a bit more power)
+  // BLE and WiFi share one radio. A 99/100 window means BLE is listening
+  // almost continuously, leaving WiFi almost no airtime -- which is a big
+  // part of why things fall over once both are running. 50/100 still catches
+  // devices readily (they advertise every 20-100ms) and lets WiFi breathe.
   scanner->setInterval(100);
-  scanner->setWindow(99);
+  scanner->setWindow(50);
 
   // Start WiFi only after BLE has taken the memory it needs.
   hotspotBegin();
