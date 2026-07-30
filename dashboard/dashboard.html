@@ -90,6 +90,32 @@
   .up { color:var(--strong); } .down { color:var(--dim); }
   .empty { padding:26px 14px; color:var(--dim); text-align:center; font-size:13px; }
   tbody.stale { opacity:.45; }
+
+  /* ---- sweep ---- */
+  #sweep { margin-bottom:18px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:16px 18px; }
+  .cue { display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
+  .lamp {
+    font:700 22px/1 inherit; letter-spacing:1px; padding:16px 22px; border-radius:9px;
+    border:2px solid var(--line); min-width:210px; text-align:center;
+  }
+  .lamp.off { background:#11151c; color:#8b949e; border-color:#30363d; }
+  .lamp.on  { background:#fff8c4; color:#5a4b00; border-color:#d9c200; }
+  .count { font:600 30px/1 inherit; font-variant-numeric:tabular-nums; }
+  .hint { color:var(--dim); font-size:13px; }
+  .prog { height:5px; background:var(--line); border-radius:3px; margin-top:14px; overflow:hidden; }
+  .prog i { display:block; height:100%; background:var(--accent); transition:width .2s linear; }
+
+  .verdict { font:700 16px/1.4 inherit; margin-bottom:6px; }
+  .v-CANDIDATE { color:#f85149; }
+  .v-NONE      { color:var(--strong); }
+  .v-UNKNOWN   { color:var(--near); }
+  .vdetail { font-size:13px; color:var(--dim); max-width:76ch; }
+  .sweep-table { margin-top:14px; width:100%; border-collapse:collapse; font-size:12.5px; }
+  .sweep-table th { font-size:10.5px; padding:6px 9px; }
+  .sweep-table td { padding:6px 9px; }
+  tr.cand td { background:rgba(248,81,73,.12); font-weight:600; }
 </style>
 </head>
 <body>
@@ -98,8 +124,11 @@
   <h1>Wireless Security</h1>
   <button id="pause">Pause</button>
   <div class="status"><span class="dot" id="dot"></span><span id="status">connecting…</span></div>
+  <button id="sweep-btn">Run light sweep</button>
   <div class="paused-note" id="paused-note" hidden>view frozen — still recording in the background</div>
 </header>
+
+<div id="sweep" hidden><div class="card" id="sweep-card"></div></div>
 
 <div class="panels">
   <div class="panel">
@@ -271,6 +300,96 @@ btn.addEventListener('click', () => {
   document.getElementById('dot').classList.toggle('off', paused);
   if (!paused) tick();
 });
+
+// ---------------- sweep ----------------
+const sweepBtn  = document.getElementById('sweep-btn');
+const sweepWrap = document.getElementById('sweep');
+const sweepCard = document.getElementById('sweep-card');
+
+sweepBtn.addEventListener('click', async () => {
+  const r = await fetch('/api/sweep/start', { method: 'POST' });
+  const j = await r.json();
+  if (!j.ok) { alert(j.error || 'Could not start the sweep.'); return; }
+  sweepWrap.hidden = false;
+});
+
+function renderSweep(s) {
+  if (!s.available) { sweepBtn.disabled = true; sweepBtn.title = 'host/sweep.py not found'; }
+
+  if (s.phase === 'idle') { sweepWrap.hidden = true; return; }
+  sweepWrap.hidden = false;
+
+  if (s.phase === 'recording') {
+    sweepBtn.disabled = true;
+    sweepBtn.textContent = 'Sweep running…';
+    const period = s.period || 3;
+    // The reference wave is OFF for the first period, then ON, repeating.
+    const pos    = s.elapsed % (period * 2);
+    const lightOn = pos >= period;
+    const left   = (period - (pos % period)).toFixed(1);
+    const cycle  = Math.floor(s.elapsed / (period * 2)) + 1;
+    sweepCard.innerHTML = `
+      <div class="cue">
+        <div class="lamp ${lightOn ? 'on' : 'off'}">LIGHTS ${lightOn ? 'ON' : 'OFF'}</div>
+        <div>
+          <div class="count">${left}s</div>
+          <div class="hint">until you switch — cycle ${cycle} of ${s.cycles || 5}</div>
+        </div>
+        <div class="hint">Follow the box: flip the room light every ${period}s.<br>
+          Recording ${s.elapsed.toFixed(1)}s / ${s.duration}s.</div>
+      </div>
+      <div class="prog"><i style="width:${(s.elapsed / s.duration * 100).toFixed(1)}%"></i></div>`;
+    return;
+  }
+
+  if (s.phase === 'analyzing') {
+    sweepCard.innerHTML = '<div class="hint">Correlating traffic against the light pattern…</div>';
+    return;
+  }
+
+  if (s.phase === 'error') {
+    sweepBtn.disabled = false;
+    sweepBtn.textContent = 'Run light sweep';
+    sweepCard.innerHTML = `<div class="verdict v-UNKNOWN">Sweep failed</div>
+                           <div class="vdetail">${s.error || ''}</div>`;
+    return;
+  }
+
+  // done
+  sweepBtn.disabled = false;
+  sweepBtn.textContent = 'Run light sweep again';
+  const r = s.result || {};
+  const cls = r.verdict?.startsWith('CANDIDATE') ? 'v-CANDIDATE'
+            : r.verdict?.startsWith('NO ')       ? 'v-NONE' : 'v-UNKNOWN';
+  const rows = (r.devices || []).map(d => `
+    <tr class="${d.candidate ? 'cand' : ''}">
+      <td class="mac">${d.mac}</td>
+      <td class="num">${bytes(d.up)}</td>
+      <td class="num">${bytes(d.down)}</td>
+      <td class="num">${d.ratio === null ? '∞' : d.ratio}</td>
+      <td class="num">${d.corr}</td>
+      <td class="num">${d.lag}s</td>
+      <td>${d.evidence}</td>
+    </tr>`).join('');
+
+  sweepCard.innerHTML = `
+    <div class="verdict ${cls}">${r.verdict || '—'}</div>
+    <div class="vdetail">${r.detail || ''}</div>
+    <div class="hint" style="margin-top:8px">heartbeat coverage ${r.coverage || '—'}</div>
+    ${rows ? `<table class="sweep-table">
+      <thead><tr><th>MAC</th><th class="num">Upload</th><th class="num">Download</th>
+      <th class="num">Ratio</th><th class="num">Correlation</th><th class="num">Lag</th>
+      <th>Evidence</th></tr></thead><tbody>${rows}</tbody></table>`
+    : '<div class="hint" style="margin-top:10px">No device sent any traffic during the sweep.</div>'}`;
+}
+
+async function tickSweep() {
+  try {
+    renderSweep(await (await fetch('/api/sweep')).json());
+  } catch (e) { /* monitor.py down; the main tick reports it */ }
+}
+tickSweep();
+setInterval(tickSweep, 300);   // fast, so the light cue stays in time
 
 async function tick() {
   if (paused) return;   // freeze the view; monitor.py keeps collecting regardless
