@@ -4,14 +4,14 @@ Live dashboard for the washroom detector.
 
 Two-board setup:
 
-  BOARD 1  David's softap_demo.ino
+  BOARD 1  softap_demo.ino  (access point + sniffer)
            Hosts the WiFi network AND sniffs it. Talks CSV over USB serial:
                WINDOW,<ts_ms>,<interval_ms>,<active>
                <ts_ms>,<mac>,<up_bytes>,<down_bytes>,<up_pkts>,<down_pkts>,<rssi>
            His rows are per-window deltas (~200ms), so this script adds them up
            and derives a live bytes/sec rate.
 
-  BOARD 2  your ble_scanner.ino
+  BOARD 2  ble_scanner.ino  (Bluetooth scanner)
            Joins his network and reports BLE devices over UDP (wireless).
 
 Both feeds land in one dashboard.
@@ -27,8 +27,8 @@ REQUIREMENTS
     pip3 install pyserial      (only needed for USB; wireless works without it)
 
 NOTE
-    Only one program can hold a serial port at a time -- so this and David's
-    sweep.py cannot both read his board at once. Run one or the other. Same
+    Only one program can hold a serial port at a time -- so this and
+    host/sweep.py cannot both read the sniffer board at once. Run one or the other. Same
     goes for uploading a sketch: stop this first, or start it --no-serial.
 """
 
@@ -69,23 +69,55 @@ BLE_ROW = re.compile(
 # WiFi footer:  ---- 14 device(s) | 147 raw frames heard (now on ch 6) ----
 WIFI_FOOTER = re.compile(r"(\d+)\s+device\(s\).*?(\d+)\s+raw frames")
 
-# --- David's board (softap_demo / wifi_sniffer_v2) speaks CSV over serial ---
+# --- The sniffer/AP board speaks CSV over serial ---
 #   heartbeat : WINDOW,<ts_ms>,<interval_ms>,<active_devices>
 #   per device: <ts_ms>,<mac>,<up_bytes>,<down_bytes>,<up_pkts>,<down_pkts>,<rssi>
-# His rows are PER-WINDOW deltas (~200 ms), not running totals, so we add them
+# Its rows are PER-WINDOW deltas (~200 ms), not running totals, so we add them
 # up ourselves and also derive a live bytes/sec rate.
-DAVID_ROW = re.compile(
+SNIFFER_ROW = re.compile(
     r"^(\d+),([0-9A-Fa-f:]{17}),(\d+),(\d+),(\d+),(\d+),(-?[\d.]+)\s*$"
 )
-DAVID_WINDOW = re.compile(r"^WINDOW,(\d+)")
-DAVID_MARK = re.compile(r"^MARK,(\d+)")
+SNIFFER_WINDOW = re.compile(r"^WINDOW,(\d+)")
+SNIFFER_MARK = re.compile(r"^MARK,(\d+)")
 
 RATE_WINDOW = 3.0   # seconds of history used for the bytes/sec figure
 
 devices = {}        # key -> record shown in the UI
-accum = {}          # key -> running totals + recent samples, for David's deltas
+accum = {}          # key -> running totals + recent samples, for the sniffer's deltas
 meta = {"wifi_frames": 0, "ports": {}, "windows": 0, "last_mark": None}
 lock = threading.Lock()
+
+# --- sweep state -----------------------------------------------------------
+# Raw material for the correlation test. We keep a rolling buffer so a sweep
+# can be started at any moment without missing the first rows.
+sweep_rows = deque()      # (ts_ms, mac, up, down, up_pkts, down_pkts, rssi)
+sweep_windows = deque()   # ts_ms of WINDOW heartbeats
+SWEEP_BUFFER_S = 120
+
+sweep = {"phase": "idle",      # idle | recording | analyzing | done | error
+         "elapsed": 0.0, "duration": 30.0,
+         "result": None, "error": None, "available": False}
+
+writers = {}   # port -> open serial object, so we can send MARK to the board
+
+
+def load_sweep_module():
+    """Load the correlation math from host/sweep.py."""
+    import importlib.util
+    path = HERE.parent / "host" / "sweep.py"
+    if not path.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("sweep_analysis", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)   # safe: it's guarded by __main__
+        return mod
+    except Exception as e:
+        print(f"NOTE: couldn't load {path} ({e}); sweep disabled.")
+        return None
+
+
+SWEEP = load_sweep_module()
 
 
 def proximity(rssi):
@@ -118,8 +150,21 @@ def upsert(key, fields):
         rec["last_seen"] = now
 
 
-def handle_david_row(mac, up, down, uppkts, downpkts, rssi):
-    """One 200 ms window from David's board: accumulate totals, compute rate."""
+def trim_sweep_buffers():
+    """Keep only the recent past. Call with the lock held."""
+    if not sweep_rows and not sweep_windows:
+        return
+    newest = max(sweep_rows[-1][0] if sweep_rows else 0,
+                 sweep_windows[-1] if sweep_windows else 0)
+    cutoff = newest - SWEEP_BUFFER_S * 1000
+    while sweep_rows and sweep_rows[0][0] < cutoff:
+        sweep_rows.popleft()
+    while sweep_windows and sweep_windows[0] < cutoff:
+        sweep_windows.popleft()
+
+
+def handle_sniffer_row(mac, up, down, uppkts, downpkts, rssi):
+    """One 200 ms window from the sniffer board: accumulate totals, compute rate."""
     key = "wifi:" + mac.upper()
     now = time.time()
 
@@ -167,25 +212,32 @@ def handle_line(line, state):
     if not line:
         return
 
-    # ---- David's board: comma-separated, so it can't be confused with the
+    # ---- Sniffer board: comma-separated, so it can't be confused with the
     # space-aligned tables our own sketches print. ----
     if line.startswith("#") or line.startswith("ts_ms,"):
         return                                  # his config echoes / CSV header
-    m = DAVID_WINDOW.match(line)
+    m = SNIFFER_WINDOW.match(line)
     if m:
         with lock:
             meta["windows"] += 1
-            meta["ports"][state.get("port", "serial")] = "connected (David's board)"
+            meta["ports"][state.get("port", "serial")] = "connected (sniffer board)"
+            sweep_windows.append(int(m.group(1)))
+            trim_sweep_buffers()
         return
-    m = DAVID_MARK.match(line)
+    m = SNIFFER_MARK.match(line)
     if m:
         with lock:
             meta["last_mark"] = int(m.group(1))
         return
-    m = DAVID_ROW.match(line)
+    m = SNIFFER_ROW.match(line)
     if m:
         ts, mac, up, down, uppkts, downpkts, rssi = m.groups()
-        handle_david_row(mac, int(up), int(down),
+        row = (int(ts), mac, int(up), int(down),
+               int(uppkts), int(downpkts), float(rssi))
+        with lock:
+            sweep_rows.append(row)
+            trim_sweep_buffers()
+        handle_sniffer_row(mac, int(up), int(down),
                          int(uppkts), int(downpkts), float(rssi))
         return
 
@@ -247,6 +299,7 @@ def reader(port):
             with serial.Serial(port, BAUD, timeout=2) as ser:
                 with lock:
                     meta["ports"][port] = "connected"
+                writers[port] = ser   # so a sweep can send MARK to this board
                 buf = b""
                 while True:
                     chunk = ser.read(256)
@@ -256,9 +309,140 @@ def reader(port):
                             raw, buf = buf.split(b"\n", 1)
                             handle_line(raw.decode("utf-8", "replace"), state)
         except Exception as e:
+            writers.pop(port, None)
             with lock:
                 meta["ports"][port] = f"disconnected ({type(e).__name__})"
             time.sleep(2)
+
+
+def send_to_board(text):
+    """Write a command to whichever serial board is open. True if it went out."""
+    for port, ser in list(writers.items()):
+        try:
+            ser.write(text.encode())
+            ser.flush()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def analyze_sweep(rows, windows, mark_ts_ms, duration_s):
+    """Verdict logic from sweep.py, returning structured data instead of printing."""
+    S = SWEEP
+    if mark_ts_ms is None:
+        return {"verdict": "UNKNOWN - INCOMPLETE SWEEP",
+                "detail": "The board never acknowledged the MARK, so there is no "
+                          "reference point to correlate against.",
+                "coverage": "0/0", "devices": []}
+
+    duration_ms = int(duration_s * 1000)
+    expected = duration_ms // S.BIN_MS
+    got = sum(1 for w in windows if 0 <= w - mark_ts_ms < duration_ms)
+    coverage_ok = got >= S.MIN_WINDOW_FRACTION * expected
+
+    in_sweep = [r for r in rows if 0 <= r[0] - mark_ts_ms < duration_ms]
+    reference = S.build_reference(duration_s)
+    total_bytes = sum(r[2] + r[3] for r in in_sweep)
+    ambient = total_bytes / duration_s if duration_s > 0 else 0
+
+    results, candidates = [], []
+    for mac in sorted(set(r[1] for r in in_sweep)):
+        up_total = sum(r[2] for r in in_sweep if r[1] == mac)
+        down_total = sum(r[3] for r in in_sweep if r[1] == mac)
+        ratio = (up_total / down_total) if down_total > 0 else (
+            float("inf") if up_total > 0 else 0.0)
+
+        series = S.bin_series(in_sweep, mac, mark_ts_ms, duration_s, "up")
+        corr, lag = S.best_lag_correlation(series, reference)
+        active_bins = sum(1 for v in series if v > 0)
+        enough = up_total >= S.MIN_UP_BYTES and active_bins >= S.MIN_ACTIVE_BINS
+        asymmetric = ratio >= S.ASYMMETRY_MIN_RATIO
+        correlated = abs(corr) >= S.CORR_THRESHOLD
+        is_candidate = enough and asymmetric and correlated
+
+        results.append({
+            "mac": mac.upper(), "up": up_total, "down": down_total,
+            "ratio": None if ratio == float("inf") else round(ratio, 2),
+            "corr": round(corr, 2), "lag": round(lag, 2),
+            "active_bins": active_bins,
+            "evidence": "ok" if enough else f"thin ({active_bins} bins)",
+            "candidate": is_candidate,
+        })
+        if is_candidate:
+            candidates.append(results[-1])
+
+    results.sort(key=lambda r: (not r["candidate"], -abs(r["corr"])))
+
+    # Verdict precedence: a positive detection stands even on a
+    # degraded sweep, but a negative result on a broken feed means nothing.
+    if candidates:
+        verdict = "CANDIDATE DETECTED"
+        detail = "; ".join(
+            f"{c['mac']} — upload/download {'∞' if c['ratio'] is None else c['ratio']}×, "
+            f"light correlation {c['corr']} at {c['lag']}s lag" for c in candidates)
+        if not coverage_ok:
+            detail += ". Coverage was degraded: this detection stands, but the " \
+                      "absence of other candidates is not meaningful."
+    elif not coverage_ok:
+        verdict = "UNKNOWN - INCOMPLETE SWEEP"
+        detail = (f"Only {got} of {expected} heartbeat windows arrived. The link "
+                  "dropped or the board was interrupted, so this proves nothing.")
+    elif ambient > S.HIGH_TRAFFIC_BYTES_PER_S:
+        verdict = "UNKNOWN - HIGH AMBIENT TRAFFIC"
+        detail = (f"{ambient/1e6:.1f} MB/s of ambient traffic drowns out the "
+                  "correlation. Try again somewhere quieter.")
+    else:
+        verdict = "NO NETWORKED CAMERA DETECTED"
+        detail = ("No device's upload tracked the light. This is NOT an all-clear: "
+                  "a camera recording to local storage, a wired camera, or anything "
+                  "on 5 GHz transmits nothing this test can see.")
+
+    return {"verdict": verdict, "detail": detail,
+            "coverage": f"{got}/{expected}", "devices": results}
+
+
+def run_sweep():
+    """Send MARK, record for the stimulus duration, then analyze."""
+    S = SWEEP
+    duration = S.STIMULUS_PERIOD_S * 2 * S.STIMULUS_CYCLES   # 3s x2 x5 = 30s
+
+    with lock:
+        sweep_rows.clear()
+        sweep_windows.clear()
+        meta["last_mark"] = None
+        sweep.update(phase="recording", elapsed=0.0, duration=duration,
+                     result=None, error=None)
+
+    if not send_to_board("MARK\n"):
+        with lock:
+            sweep.update(phase="error",
+                         error="No board on USB to send MARK to. Is it plugged in, "
+                               "and is monitor.py running without --no-serial?")
+        return
+
+    t0 = time.time()
+    while True:
+        el = time.time() - t0
+        if el >= duration:
+            break
+        with lock:
+            sweep["elapsed"] = round(el, 1)
+        time.sleep(0.1)
+
+    with lock:
+        sweep.update(phase="analyzing", elapsed=duration)
+        rows = list(sweep_rows)
+        wins = list(sweep_windows)
+        mark = meta["last_mark"]
+
+    try:
+        result = analyze_sweep(rows, wins, mark, duration)
+        with lock:
+            sweep.update(phase="done", result=result)
+    except Exception as e:
+        with lock:
+            sweep.update(phase="error", error=f"Analysis failed: {e}")
 
 
 def udp_listener(udp_port):
@@ -338,7 +522,42 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass  # keep the console quiet
 
+    def _json(self, payload, code=200):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path.startswith("/api/sweep/start"):
+            if SWEEP is None:
+                self._json({"ok": False,
+                            "error": "host/sweep.py not found, so the sweep "
+                                     "analysis is unavailable."}, 400)
+                return
+            with lock:
+                busy = sweep["phase"] in ("recording", "analyzing")
+            if busy:
+                self._json({"ok": False, "error": "A sweep is already running."}, 409)
+                return
+            threading.Thread(target=run_sweep, daemon=True).start()
+            self._json({"ok": True})
+            return
+        self._json({"ok": False, "error": "unknown endpoint"}, 404)
+
     def do_GET(self):
+        if self.path.startswith("/api/sweep"):
+            with lock:
+                state = dict(sweep)
+                state["available"] = SWEEP is not None
+                if SWEEP is not None:
+                    state["period"] = SWEEP.STIMULUS_PERIOD_S
+                    state["cycles"] = SWEEP.STIMULUS_CYCLES
+            self._json(state)
+            return
+
         if self.path.startswith("/api/devices"):
             now = time.time()
             with lock:
@@ -382,7 +601,7 @@ def main():
                          "reflashing a board, so the upload isn't blocked")
     args = ap.parse_args()
 
-    # Serial is ON by default: David's board reports over USB, so the common
+    # Serial is ON by default: the sniffer board reports over USB, so the common
     # case should just work. Pass --no-serial to free the port for an upload.
     ports = [] if args.no_serial else (args.port or autodetect())
 
