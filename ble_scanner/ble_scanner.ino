@@ -17,6 +17,21 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <stdarg.h>
+
+// ===== NETWORK: David's SoftAP (softap_demo.ino) =====
+// Set WIFI_SSID to "" to run USB/serial only, with no networking at all.
+// NOTE: Arduino IDE -> Tools -> Partition Scheme -> "Huge APP (3MB No OTA)"
+// BLE + WiFi together is a big build and won't fit the default partition.
+#define WIFI_SSID  "WashroomSweep-Test"   // David's SoftAP
+#define WIFI_PASS  "sweep12345"
+#define UNIT_ID    "ble-B"       // name this board (unique per board)
+#define UDP_PORT   4210          // must match monitor.py --udp-port
+#define RETRY_INTERVAL 15000     // ms between hotspot reconnect attempts
+#define STATUS_LED 2             // onboard LED: fast blink = no hotspot,
+                                 // brief blip = connected and reporting
 
 #define SCAN_SECONDS 5       // length of each scan pass
 #define MAX_DEVICES  120     // max devices remembered at once
@@ -35,6 +50,10 @@ struct BleDev {
 
 BleDev devices[MAX_DEVICES];
 BLEScan* scanner;
+
+WiFiUDP udp;
+bool reporting = false;        // true if we're set up to send over WiFi
+uint32_t lastConnectTry = 0;   // last hotspot reconnect attempt
 
 // A few common Bluetooth SIG company IDs. Extend from the official
 // "Company Identifiers" list if you want to name more makers.
@@ -69,10 +88,22 @@ int addDevice(const char* addr) {
     if (!devices[i].used) {
       devices[i] = {};
       devices[i].used = true;
-      strncpy(devices[i].addr, addr, 17);
+      strncpy(devices[i].addr, addr, sizeof(devices[i].addr) - 1);
+      devices[i].addr[sizeof(devices[i].addr) - 1] = '\0';
       return i;
     }
-  return -1;
+
+  // Table full. Phones rotate their addresses constantly, so the table fills
+  // with ghosts; evict the one we haven't heard from in the longest time
+  // rather than going blind to every new device.
+  int oldest = 0;
+  for (int i = 1; i < MAX_DEVICES; i++)
+    if (devices[i].lastSeen < devices[oldest].lastSeen) oldest = i;
+  devices[oldest] = {};
+  devices[oldest].used = true;
+  strncpy(devices[oldest].addr, addr, sizeof(devices[oldest].addr) - 1);
+  devices[oldest].addr[sizeof(devices[oldest].addr) - 1] = '\0';
+  return oldest;
 }
 
 // Called once per advertisement heard during a scan.
@@ -90,8 +121,12 @@ class FoundCallback : public BLEAdvertisedDeviceCallbacks {
     uint8_t t = d.getAddressType();
     devices[i].randomAddr = (t == BLE_ADDR_TYPE_RANDOM || t == BLE_ADDR_TYPE_RPA_RANDOM);
 
-    if (d.haveName())
-      strncpy(devices[i].name, d.getName().c_str(), 23);
+    // Always leave room for the terminator -- strncpy won't add one if the
+    // source is longer than the buffer.
+    if (d.haveName()) {
+      strncpy(devices[i].name, d.getName().c_str(), sizeof(devices[i].name) - 1);
+      devices[i].name[sizeof(devices[i].name) - 1] = '\0';
+    }
 
     if (d.haveManufacturerData()) {
       String md = d.getManufacturerData();
@@ -134,7 +169,130 @@ void printTable() {
                   d.maker[0] ? d.maker : "-",
                   d.name[0] ? d.name : "");
   }
-  Serial.printf("---- %d BLE device(s) in range ----\n", n);
+  // Free heap is the number to watch: BLE and WiFi stacks together are tight,
+  // and abort()/reboot crashes are usually memory running out. If this keeps
+  // falling pass after pass, something is leaking.
+  Serial.printf("---- %d BLE device(s) in range | free heap %lu bytes ----\n",
+                n, (unsigned long)ESP.getFreeHeap());
+}
+
+// Device names come from the air, so quotes/backslashes must be escaped
+// before they go into JSON.
+void jsonEscape(const char* in, char* out, size_t cap) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 2 < cap; i++) {
+    unsigned char c = in[i];
+    if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = c; }
+    else if (c >= 32 && c < 127) out[o++] = c;   // drop control/non-ASCII bytes
+  }
+  out[o] = 0;
+}
+
+// Append to a buffer SAFELY.
+//
+// snprintf() returns the length it WOULD have written, not what it did. Adding
+// that straight onto len lets len run past the end of the buffer -- and then
+// "cap - len" underflows (it's unsigned) into a huge value, so the next write
+// scribbles all over memory. That was a real crash: Guru Meditation /
+// LoadProhibited. This helper never advances len past the buffer, and reports
+// false if the text didn't fit so the caller can flush and start a new packet.
+static bool appendf(char* buf, size_t cap, int& len, const char* fmt, ...) {
+  if (len < 0 || (size_t)len >= cap) return false;
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vsnprintf(buf + len, cap - len, fmt, ap);
+  va_end(ap);
+  if (r < 0 || (size_t)r >= cap - len) {
+    buf[len] = '\0';   // roll back the partial write
+    return false;
+  }
+  len += r;
+  return true;
+}
+
+void sendReport() {
+  if (!reporting) return;
+  if (WiFi.status() != WL_CONNECTED) return;  // hotspotPoll() handles reconnects
+
+  uint32_t now = millis();
+  char buf[1200], nameEsc[48], makerEsc[32];
+  int i = 0;
+  while (i < MAX_DEVICES) {
+    int len = 0;
+    buf[0] = '\0';
+    appendf(buf, sizeof(buf), len,
+            "{\"unit\":\"%s\",\"src\":\"ble\",\"devices\":[", UNIT_ID);
+
+    int inChunk = 0;
+    while (i < MAX_DEVICES && inChunk < 8) {
+      BleDev& d = devices[i];
+      if (!d.used || now - d.lastSeen > FORGET_AFTER) { i++; continue; }
+
+      jsonEscape(d.name, nameEsc, sizeof(nameEsc));
+      jsonEscape(d.maker, makerEsc, sizeof(makerEsc));
+      if (!appendf(buf, sizeof(buf), len,
+            "%s{\"mac\":\"%s\",\"rssi\":%d,\"dist\":\"%s\",\"priv\":%d,"
+            "\"seen\":%lu,\"maker\":\"%s\",\"name\":\"%s\"}",
+            inChunk ? "," : "", d.addr, d.rssi, proximity(d.rssi),
+            d.randomAddr ? 1 : 0, d.seen, makerEsc, nameEsc)) {
+        break;   // didn't fit: send what we have, retry this device next packet
+      }
+      inChunk++;
+      i++;
+    }
+
+    if (inChunk == 0) break;
+    if (!appendf(buf, sizeof(buf), len, "]}")) continue;  // no room to close
+
+    // Broadcast, so you don't have to hardcode the laptop's IP address.
+    udp.beginPacket(IPAddress(255, 255, 255, 255), UDP_PORT);
+    udp.print(buf);
+    udp.endPacket();
+    delay(5);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  Hotspot handling -- NON-BLOCKING.
+//
+//  Never sit in a wait loop here: every second spent waiting on WiFi is a
+//  second we are not scanning for BLE devices. We kick off the connection
+//  and then just check on it once per pass.
+// ---------------------------------------------------------------------
+
+void hotspotBegin() {
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("No hotspot configured -- USB/serial only.");
+    return;
+  }
+  Serial.printf("Joining hotspot \"%s\" in the background...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();   // cancel anything in flight ("cannot set config")
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  lastConnectTry = millis();
+}
+
+void hotspotPoll() {
+  if (strlen(WIFI_SSID) == 0) return;
+  bool up = (WiFi.status() == WL_CONNECTED);
+
+  if (up && !reporting) {
+    reporting = true;
+    udp.begin(UDP_PORT);
+    Serial.printf("Hotspot connected. IP %s -- broadcasting to UDP port %d.\n",
+                  WiFi.localIP().toString().c_str(), UDP_PORT);
+  } else if (!up && reporting) {
+    reporting = false;
+    Serial.println("Hotspot lost -- scanning continues, will retry.");
+  }
+
+  // Retry on our own schedule, without ever blocking the scan loop.
+  if (!up && millis() - lastConnectTry > RETRY_INTERVAL) {
+    lastConnectTry = millis();
+    Serial.println("Retrying hotspot...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
 }
 
 void setup() {
@@ -142,17 +300,32 @@ void setup() {
   delay(300);
   Serial.println("\nBLE Device Detector starting...");
 
+  pinMode(STATUS_LED, OUTPUT);
+
   BLEDevice::init("");
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new FoundCallback());
   scanner->setActiveScan(true);   // ask devices for names (uses a bit more power)
   scanner->setInterval(100);
   scanner->setWindow(99);
+
+  // Start WiFi only after BLE has taken the memory it needs.
+  hotspotBegin();
 }
 
 void loop() {
   scanner->start(SCAN_SECONDS, false);
+  scanner->stop();                // make sure the scan is fully finished
   scanner->clearResults();        // free the library's buffer; our table persists
   printTable();
+  sendReport();
+  hotspotPoll();                  // returns immediately -- never blocks the scan
+
+  // LED: fast blink = no hotspot, brief blip = connected and reporting.
+  digitalWrite(STATUS_LED,
+    ((reporting && WiFi.status() == WL_CONNECTED)
+       ? (millis() % 2000) < 80
+       : (millis() % 200) < 100) ? HIGH : LOW);
+
   delay(200);
 }
