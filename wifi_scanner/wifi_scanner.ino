@@ -11,28 +11,33 @@
 #include "esp_wifi.h"
 
 // ----- Settings you can tweak -----
-#define HOP_INTERVAL    250     // ms spent listening on each channel
-#define PRINT_INTERVAL  3000    // ms between printed device tables
-#define FORGET_AFTER    30000   // ms: drop a device if unseen this long
-#define MAX_DEVICES     100     // max devices tracked at once
+#define HOP_INTERVAL 250     // ms spent listening on each channel
+#define PRINT_INTERVAL 3000  // ms between printed device tables
+#define FORGET_AFTER 30000   // ms: drop a device if unseen this long
+#define MAX_DEVICES 100      // max devices tracked at once
 
 // Common 2.4 GHz channels. Add 2,3,4,5,7,8,9,10,12,13 for a fuller sweep
 // (more thorough, but slower to revisit each channel).
-const uint8_t channels[] = {1, 6, 11};
+const uint8_t channels[] = { 1, 6, 11 };
 const int NUM_CHANNELS = sizeof(channels) / sizeof(channels[0]);
 
 // ----- One tracked device -----
 struct Device {
-  uint8_t  mac[6];
-  int8_t   rssi;       // signal strength, dBm (closer to 0 = closer/stronger)
-  uint8_t  channel;
-  uint32_t count;      // how many packets we've heard from it
-  uint32_t lastSeen;   // millis() of last packet
-  bool     used;
+  uint8_t mac[6];
+  int8_t rssi;  // signal strength, dBm (closer to 0 = closer/stronger)
+  uint8_t channel;
+  uint32_t count;     // how many packets we've heard from it
+  uint32_t lastSeen;  // millis() of last packet
+  bool used;
 };
 
 Device devices[MAX_DEVICES];
 int channelIdx = 0;
+
+// Raw count of EVERY frame the radio hands us (before any filtering).
+// If this stays 0, the radio isn't receiving; if it climbs but devices
+// stay 0, the problem is in how we parse frames.
+volatile uint32_t totalPackets = 0;
 
 int findDevice(const uint8_t* mac) {
   for (int i = 0; i < MAX_DEVICES; i++)
@@ -54,15 +59,16 @@ int addDevice(const uint8_t* mac) {
 // Called for every WiFi packet the radio hears.
 void onPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
   const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-  if (pkt->rx_ctrl.sig_len < 16) return;      // too short to hold a sender MAC
+  totalPackets++;                         // count it before any filtering
+  if (pkt->rx_ctrl.sig_len < 16) return;  // too short to hold a sender MAC
 
-  const uint8_t* txMac = pkt->payload + 10;   // addr2 = transmitter address
+  const uint8_t* txMac = pkt->payload + 10;  // addr2 = transmitter address
   int i = findDevice(txMac);
   if (i < 0) i = addDevice(txMac);
-  if (i < 0) return;                          // table full, skip
+  if (i < 0) return;  // table full, skip
 
-  devices[i].rssi     = pkt->rx_ctrl.rssi;
-  devices[i].channel  = pkt->rx_ctrl.channel;
+  devices[i].rssi = pkt->rx_ctrl.rssi;
+  devices[i].channel = pkt->rx_ctrl.channel;
   devices[i].count++;
   devices[i].lastSeen = millis();
 }
@@ -75,29 +81,49 @@ void printTable() {
   Serial.println("MAC                RSSI  ch   pkts   age");
   for (int i = 0; i < MAX_DEVICES; i++) {
     if (!devices[i].used) continue;
-    if (now - devices[i].lastSeen > FORGET_AFTER) { devices[i].used = false; continue; }
+    if (now - devices[i].lastSeen > FORGET_AFTER) {
+      devices[i].used = false;
+      continue;
+    }
 
     uint8_t* m = devices[i].mac;
     Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X  %4d  %2d  %5lu   %lus\n",
-      m[0], m[1], m[2], m[3], m[4], m[5],
-      devices[i].rssi, devices[i].channel, devices[i].count,
-      (now - devices[i].lastSeen) / 1000);
+                  m[0], m[1], m[2], m[3], m[4], m[5],
+                  devices[i].rssi, devices[i].channel, devices[i].count,
+                  (now - devices[i].lastSeen) / 1000);
     shown++;
   }
-  Serial.printf("---- %d device(s) currently in range ----\n", shown);
+  Serial.printf("---- %d device(s) in range | %lu raw frames heard (ch %d) ----\n",
+                shown, totalPackets, channels[channelIdx]);
 }
 
 uint32_t lastHop = 0, lastPrint = 0;
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  Serial.println("\nWiFi Device Detector starting (2.4 GHz, passive)...");
+  delay(1000);  // Give serial monitor time to connect
 
-  WiFi.mode(WIFI_MODE_NULL);
+  Serial.println("\nInitializing WiFi radio...");
+
+  // Start the WiFi driver. STA mode boots and STARTS the radio, which is
+  // required before promiscuous mode will actually receive anything.
+  // (Do NOT call WiFi.disconnect(true) here -- that powers the radio OFF.)
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  // Turn on promiscuous (monitor) mode and register our callback.
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&onPacket);
+
+  // Listen to management frames (beacons/probes -> APs & phones) and data
+  // frames (actual traffic). This is what lets us see devices.
+  wifi_promiscuous_filter_t filter = {};
+  filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  esp_wifi_set_promiscuous_filter(&filter);
+
   esp_wifi_set_channel(channels[0], WIFI_SECOND_CHAN_NONE);
+
+  Serial.println("WiFi Device Detector starting (2.4 GHz, passive)...");
 }
 
 void loop() {
