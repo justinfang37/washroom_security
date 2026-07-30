@@ -42,10 +42,15 @@
 //   50 = half and half. Noticeably fewer devices, slower to spot them.
 // Start high; only lower it if the board starts rebooting with WiFi on.
 #define SCAN_WINDOW  90
-// Each entry is ~72 bytes of static RAM, which indirectly limits heap. 120 was
-// too many once WiFi came up alongside BLE; 48 is plenty for a room.
-#define MAX_DEVICES  48      // max devices remembered at once
-#define FORGET_AFTER 60000   // ms: drop a device if unseen this long
+// Each entry is ~72 bytes of static RAM, which indirectly limits heap. Sized
+// to the room: captures here showed 120+ advertisers, so a small table sits
+// permanently full and evicts real devices to make room for ghosts.
+#define MAX_DEVICES  100     // max devices remembered at once
+
+// Phones rotate their BLE address every ~15 min, so the table fills with
+// devices that no longer exist. Expiring quickly keeps the list to what is
+// actually present now, which matters far more than remembering the past.
+#define FORGET_AFTER 20000   // ms: drop a device if unseen this long
 #define MIN_FREE_HEAP 35000  // below this we skip reporting rather than crash
 
 struct BleDev {
@@ -65,6 +70,11 @@ BLEScan* scanner;
 WiFiUDP udp;
 bool reporting = false;        // true if we're set up to send over WiFi
 uint32_t lastConnectTry = 0;   // last hotspot reconnect attempt
+
+// How many times a new device displaced an old one because the table was full.
+// If this climbs fast, MAX_DEVICES is too small for this room and real devices
+// are being pushed out -- that looks exactly like "detection got worse".
+uint32_t evictions = 0;
 
 // A few common Bluetooth SIG company IDs. Extend from the official
 // "Company Identifiers" list if you want to name more makers.
@@ -107,6 +117,7 @@ int addDevice(const char* addr) {
   // Table full. Phones rotate their addresses constantly, so the table fills
   // with ghosts; evict the one we haven't heard from in the longest time
   // rather than going blind to every new device.
+  evictions++;
   int oldest = 0;
   for (int i = 1; i < MAX_DEVICES; i++)
     if (devices[i].lastSeen < devices[oldest].lastSeen) oldest = i;
@@ -183,8 +194,12 @@ void printTable() {
   // Free heap is the number to watch: BLE and WiFi stacks together are tight,
   // and abort()/reboot crashes are usually memory running out. If this keeps
   // falling pass after pass, something is leaking.
-  Serial.printf("---- %d BLE device(s) in range | free heap %lu bytes ----\n",
-                n, (unsigned long)ESP.getFreeHeap());
+  Serial.printf("---- %d/%d slots used | %lu evictions | free heap %lu ----\n",
+                n, MAX_DEVICES, (unsigned long)evictions,
+                (unsigned long)ESP.getFreeHeap());
+  if (n >= MAX_DEVICES)
+    Serial.println("!! table FULL -- real devices are being pushed out. "
+                   "Raise MAX_DEVICES or lower FORGET_AFTER.");
 }
 
 // Device names come from the air, so quotes/backslashes must be escaped
