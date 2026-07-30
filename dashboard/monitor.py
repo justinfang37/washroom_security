@@ -565,11 +565,15 @@ class Handler(BaseHTTPRequestHandler):
                     del devices[k]
                     accum.pop(k, None)   # drop its running totals too
                 payload = {
+                    # Sort strongest first, but in 3 dB buckets with the MAC as
+                    # a tiebreaker. RSSI wobbles a couple of dB constantly, and
+                    # sorting on the raw value made rows swap places every
+                    # second -- permanently mid-animation and unreadable.
                     "devices": sorted(
                         [dict(r, age=round(now - r["last_seen"], 1),
                                  uptime=round(now - r["first_seen"]))
                          for r in devices.values()],
-                        key=lambda r: -r["rssi"],
+                        key=lambda r: (-round(r["rssi"] / 3), r["mac"]),
                     ),
                     "meta": dict(meta),
                 }
